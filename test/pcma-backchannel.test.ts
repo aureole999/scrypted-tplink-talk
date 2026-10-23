@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Writable } from 'stream';
-import { PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
+import { audioSendModes, PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
 
 class FakeClock {
     time = 0;
@@ -48,7 +48,7 @@ test('reassembles arbitrary RTP sizes into 1024-sample PES at 128 ms intervals',
     const output = new Writable({ write(data, _, callback) {
         writes.push({ at: clock.now(), data: Buffer.from(data) }); callback();
     } });
-    const sender = new PcmaBackchannel(output, clock);
+    const sender = new PcmaBackchannel(output, { clock });
     const samples = Buffer.from(Array.from({ length: 3072 }, (_, i) => i % 251));
     for (let offset = 0; offset < samples.length; offset += 160)
         sender.pushRtp(rtp(samples.subarray(offset, offset + 160)));
@@ -65,7 +65,7 @@ test('late timers do not burst and stop cancels queued audio', () => {
     const clock = new FakeClock();
     const times: number[] = [];
     const output = new Writable({ write(_data, _, callback) { times.push(clock.now()); callback(); } });
-    const sender = new PcmaBackchannel(output, clock);
+    const sender = new PcmaBackchannel(output, { clock });
     sender.pushRtp(rtp(Buffer.alloc(4096)));
     clock.time = 500; // simulate a stalled event loop
     clock.advance(0);
@@ -85,7 +85,7 @@ test('bounded queue retains recent audio when the network is backpressured', asy
     const output = new Writable({ highWaterMark: 1, write(data, _, callback) {
         writes.push(Buffer.from(data)); complete = callback;
     } });
-    const sender = new PcmaBackchannel(output, clock);
+    const sender = new PcmaBackchannel(output, { clock });
     sender.pushRtp(rtp(Buffer.concat([Buffer.alloc(8192, 0x11), Buffer.alloc(8192, 0x22)])));
     clock.advance(256);
     assert.equal(writes.length, 1); // only PAT/PMT until TCP drains
@@ -111,4 +111,48 @@ test('RTP parser skips CSRC, extension and padding; rejects malformed packets', 
     packet[packet.length - 1] = 200;
     assert.equal(pcmaRtpPayload(packet), undefined);
     assert.equal(pcmaRtpPayload(Buffer.from([0x80, 0, ...Buffer.alloc(20)])), undefined);
+});
+
+
+test('VIGI mode preserves RTP frame sizes and sends at arrival time without pacing', () => {
+    const clock = new FakeClock();
+    const writes: { at: number; data: Buffer }[] = [];
+    const output = new Writable({ write(data, _, callback) {
+        writes.push({ at: clock.now(), data: Buffer.from(data) }); callback();
+    } });
+    const sender = new PcmaBackchannel(output, { clock, mode: audioSendModes.vigi });
+    const frames = [Buffer.alloc(160, 0x11), Buffer.alloc(1188, 0x22), Buffer.alloc(320, 0x33)];
+    sender.pushRtp(rtp(frames[0]));
+    clock.advance(7);
+    sender.pushRtp(rtp(frames[1]));
+    sender.pushRtp(rtp(frames[2]));
+    assert.deepEqual(writes.slice(1).map(w => w.at), [0, 7, 7]);
+    assert.deepEqual(writes.slice(1).map(w => audio(w.data)), frames);
+    clock.advance(1000);
+    assert.equal(writes.length, 4);
+    sender.stop();
+    sender.pushRtp(rtp(Buffer.alloc(160)));
+    assert.equal(writes.length, 4);
+});
+
+test('VIGI mode respects backpressure and retains recent complete RTP frames', async () => {
+    const writes: Buffer[] = [];
+    let complete: (() => void) | undefined;
+    const output = new Writable({ highWaterMark: 1, write(data, _, callback) {
+        writes.push(Buffer.from(data)); complete = callback;
+    } });
+    const sender = new PcmaBackchannel(output, { mode: audioSendModes.vigi });
+    for (let i = 0; i < 10; i++)
+        sender.pushRtp(rtp(Buffer.alloc(1024, i)));
+    assert.equal(writes.length, 1);
+    complete!();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(writes.length, 2);
+    assert.deepEqual(audio(writes[1]), Buffer.alloc(1024, 2));
+    sender.stop();
+    complete!();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(writes.length, 2);
+    assert.equal(output.listenerCount('drain'), 0);
+    output.destroy();
 });

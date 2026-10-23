@@ -37,6 +37,7 @@ Replace `SCRYPTED_HOST:10443` with your Scrypted server address. Deployment requ
 - Reassemble PCMA RTP into 1024-sample audio frames at 8 kHz, and send at 128 ms intervals instead of forwarding arbitrary RTP payload sizes immediately.
 - Preserve MPEG-TS continuity counters across PES boundaries; use the 90 kHz PTS clock, MPEG-2 PSI CRC, and valid stuffing.
 - Use TCP_NODELAY, write each multipart message together, and propagate socket backpressure. Bound queued live audio to about one second; discard old whole frames if the connection stalls.
+- Offer **Audio Sending** choices: `1024 samples / 128 ms` (default), or `VIGI RTP / immediate` to preserve each FFmpeg RTP payload as one PES and send it as it arrives. The VIGI option retains the corrected MPEG-TS timestamps, continuity counters, CRC, TCP_NODELAY, and bounded backpressure handling; it compares framing and cadence only.
 - Offer `aec` (default) and `half_duplex` in the camera's **Talk Mode** setting. Stop and restart talkback after changing the mode.
 
 The framing and pacing are based on direct speaker tests with a TP-Link TL-IPC43AN-WB4 V1.0, firmware 1.0.6 Build 200818 Rel.67021n. Both modes were audible and clear with the test sender. End-to-end HomeKit behavior still needs confirmation after installing this fork.
@@ -70,6 +71,7 @@ Fill in the mixin settings only when auto-detection is missing something or the 
 | `Username` | The existing ONVIF/RTSP camera was added with a non-admin user. Set this to `admin`. |
 | `Admin Password` | The existing ONVIF/RTSP camera password is missing, wrong, or belongs to a non-admin user. |
 | `Port` | The VIGI stream service is not reachable on `8800`. |
+| `Audio Sending` | Choose `1024 samples / 128 ms` (default) or `VIGI RTP / immediate`. Independent of AEC/half-duplex. Stop and restart talkback after changing. |
 | `Talk Mode` | Choose `aec` for echo cancellation or `half_duplex` for one-way-at-a-time talkback. Default: `aec`. |
 | `Channel` | Multi-channel devices only. Most standalone cameras should stay on `0`. |
 

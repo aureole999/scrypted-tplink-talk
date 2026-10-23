@@ -6,6 +6,12 @@ export const pcmaFrameSamples = 1024;
 export const pcmaFrameMilliseconds = pcmaFrameSamples * 1000 / 8000;
 const maximumBufferedSamples = pcmaFrameSamples * 8;
 
+export const audioSendModes = {
+    paced: '1024 samples / 128 ms',
+    vigi: 'VIGI RTP / immediate',
+} as const;
+export type AudioSendMode = typeof audioSendModes[keyof typeof audioSendModes];
+
 interface Clock {
     now(): number;
     schedule(callback: () => void, milliseconds: number): unknown;
@@ -17,6 +23,11 @@ const realClock: Clock = {
     schedule: (callback, milliseconds) => setTimeout(callback, milliseconds),
     cancel: timer => clearTimeout(timer as NodeJS.Timeout),
 };
+
+interface BackchannelOptions {
+    mode?: AudioSendMode;
+    clock?: Clock;
+}
 
 // FFmpeg RTP boundaries are not camera audio frame boundaries.
 export function pcmaRtpPayload(rtp: Buffer): Buffer | undefined {
@@ -45,21 +56,43 @@ export class PcmaBackchannel {
     private stopped = false;
     private nextSendAt = 0;
     private writer = new MpegTSWriter();
+    private clock: Clock;
+    private mode: AudioSendMode;
+    private immediateFrames: Buffer[] = [];
+    private immediateSamples = 0;
 
-    constructor(private output: Writable, private clock: Clock = realClock) {
+    constructor(private output: Writable, options: BackchannelOptions = {}) {
+        this.clock = options.clock || realClock;
+        this.mode = options.mode || audioSendModes.paced;
         this.writer.addPES(68, StreamTypePCMATapo);
         this.writer.writePAT();
         this.writer.writePMT();
         output.write(this.writer.resetBytes());
         output.once('close', this.stop);
+        if (this.mode === audioSendModes.vigi)
+            output.on('drain', this.flushImmediate);
     }
 
     pushRtp(rtp: Buffer): void {
         if (this.stopped)
             return;
+        if (this.output.destroyed) {
+            this.stop();
+            return;
+        }
         const payload = pcmaRtpPayload(rtp);
         if (!payload)
             return;
+        if (this.mode === audioSendModes.vigi) {
+            // Match upstream's framing/cadence: one PES per arriving RTP payload,
+            // with no 1024-sample aggregation or 128 ms timer.
+            this.immediateFrames.push(payload);
+            this.immediateSamples += payload.length;
+            while (this.immediateSamples > maximumBufferedSamples && this.immediateFrames.length > 1)
+                this.immediateSamples -= this.immediateFrames.shift()!.length;
+            this.flushImmediate();
+            return;
+        }
         this.pending = Buffer.concat([this.pending, payload]);
         // UDP cannot be backpressured. Drop old whole audio frames on overload
         // rather than letting live talkback latency grow without a bound.
@@ -76,8 +109,24 @@ export class PcmaBackchannel {
             this.clock.cancel(this.timer);
         this.timer = undefined;
         this.pending = Buffer.alloc(0);
+        this.immediateFrames = [];
+        this.immediateSamples = 0;
         this.output.off('close', this.stop);
+        this.output.off('drain', this.flushImmediate);
     };
+
+    private flushImmediate = (): void => {
+        while (!this.stopped && !this.output.destroyed && !this.output.writableNeedDrain && this.immediateFrames.length) {
+            const payload = this.immediateFrames.shift()!;
+            this.immediateSamples -= payload.length;
+            this.writeFrame(payload);
+        }
+    };
+
+    private writeFrame(payload: Buffer): void {
+        this.writer.writePES(68, 192, payload);
+        this.output.write(this.writer.resetBytes());
+    }
 
     private pump(): void {
         if (this.stopped || this.timer !== undefined || this.pending.length < pcmaFrameSamples)
@@ -94,9 +143,8 @@ export class PcmaBackchannel {
             }, delay > 0 ? delay : pcmaFrameMilliseconds);
             return;
         }
-        this.writer.writePES(68, 192, this.pending.subarray(0, pcmaFrameSamples));
+        this.writeFrame(this.pending.subarray(0, pcmaFrameSamples));
         this.pending = this.pending.subarray(pcmaFrameSamples);
-        this.output.write(this.writer.resetBytes());
         // A delayed event loop must not cause a burst of catch-up frames.
         this.nextSendAt = this.clock.now() + pcmaFrameMilliseconds;
         this.pump();

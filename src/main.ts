@@ -2,7 +2,7 @@ import sdk, { DeviceProvider, FFmpegInput, Intercom, MediaObject, MixinProvider,
 import { SettingsMixinDeviceBase } from '@scrypted/sdk/settings-mixin';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { startPcmaRtpForwarder, AudioForwarder } from './audio-forwarder';
-import { PcmaBackchannel } from './pcma-backchannel';
+import { AudioSendMode, audioSendModes, PcmaBackchannel } from './pcma-backchannel';
 import { VigiApi, TalkMode } from './vigi-api';
 
 class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> implements Intercom {
@@ -39,6 +39,12 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
             defaultValue: 'aec',
             description: 'aec enables acoustic echo cancellation. Use half_duplex for one-way-at-a-time talkback.',
         },
+        audioSendMode: {
+            title: 'Audio Sending',
+            choices: [audioSendModes.paced, audioSendModes.vigi],
+            defaultValue: audioSendModes.paced,
+            description: 'Use paced 1024-sample frames, or original VIGI RTP frame sizes and immediate sending. Independent of Talk Mode. Restart talkback after changing.',
+        },
         channel: {
             title: 'Channel',
             type: 'number',
@@ -67,7 +73,9 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
         try {
             const mode = this.storageSettings.values.talkMode as TalkMode;
             const mpegts = await client.startMpegTsBackchannel(mode);
-            const backchannel = this.backchannel = new PcmaBackchannel(mpegts);
+            const backchannel = this.backchannel = new PcmaBackchannel(mpegts, {
+                mode: this.storageSettings.values.audioSendMode as AudioSendMode,
+            });
             mpegts.on('error', e => {
                 this.console.error('TP-Link audio stream stopped:', e);
                 backchannel.stop();
