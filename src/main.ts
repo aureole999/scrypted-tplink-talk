@@ -2,7 +2,7 @@ import sdk, { DeviceProvider, FFmpegInput, Intercom, MediaObject, MixinProvider,
 import { SettingsMixinDeviceBase } from '@scrypted/sdk/settings-mixin';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { startPcmaRtpForwarder, AudioForwarder } from './audio-forwarder';
-import { AudioSendMode, audioSendModes, PcmaBackchannel } from './pcma-backchannel';
+import { AudioSendingStatistics, audioSendModes, normalizeAudioSendMode, PcmaBackchannel } from './pcma-backchannel';
 import { VigiApi, TalkMode } from './vigi-api';
 
 class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> implements Intercom {
@@ -41,9 +41,11 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
         },
         audioSendMode: {
             title: 'Audio Sending',
-            choices: [audioSendModes.paced, audioSendModes.vigi],
-            defaultValue: audioSendModes.paced,
-            description: 'Use paced 1024-sample frames, or original VIGI RTP frame sizes and immediate sending. Independent of Talk Mode. Restart talkback after changing.',
+            choices: [audioSendModes.paced64, audioSendModes.paced],
+            defaultValue: audioSendModes.paced64,
+            mapGet: normalizeAudioSendMode,
+            mapPut: (_oldValue, value) => normalizeAudioSendMode(value),
+            description: 'Choose paced 512-sample (64 ms, default) or 1024-sample (128 ms) frames. Independent of Talk Mode. Restart talkback after changing.',
         },
         channel: {
             title: 'Channel',
@@ -74,8 +76,8 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
             const mode = this.storageSettings.values.talkMode as TalkMode;
             const mpegts = await client.startMpegTsBackchannel(mode);
             const backchannel = this.backchannel = new PcmaBackchannel(mpegts, {
-                mode: this.storageSettings.values.audioSendMode as AudioSendMode,
-                onStatistics: statistics => this.console.log('TP-Link Talk audio stats:', JSON.stringify(statistics)),
+                mode: this.storageSettings.values.audioSendMode,
+                onStatistics: statistics => this.console.log(formatAudioStatistics(statistics)),
             });
             mpegts.on('error', e => {
                 this.console.error('TP-Link audio stream stopped:', e);
@@ -84,6 +86,7 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
             });
             const forwarder = this.forwarder = await startPcmaRtpForwarder(this.console, ffmpegInput,
                 rtp => backchannel.pushRtp(rtp));
+            this.console.log(`TP-Link Talk started: ${mode}, ${this.storageSettings.values.audioSendMode}.`);
             forwarder.killPromise.finally(() => {
                 backchannel.stop();
                 client.close();
@@ -183,6 +186,15 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
             password: getValue('password'),
         };
     }
+}
+
+function formatAudioStatistics(statistics: AudioSendingStatistics): string {
+    const sizes = (summary: AudioSendingStatistics['rtpReceived']) =>
+        summary.payloadSizes.map(size => `${size.bytes}B/${size.audioMilliseconds}ms x${size.count}`).join(', ') || 'none';
+    const interval = statistics.pesWritten.intervalMilliseconds?.mean;
+    return `TP-Link Talk ended: RTP [${sizes(statistics.rtpReceived)}]; sent [${sizes(statistics.pesWritten)}]` +
+        (interval === undefined ? '' : `; mean write interval ${interval}ms`) +
+        `; overload drops ${statistics.overloadDroppedSamples} samples.`;
 }
 
 function getHostFromUrl(value?: string): string | undefined {

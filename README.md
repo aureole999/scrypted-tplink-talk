@@ -34,13 +34,13 @@ Replace `SCRYPTED_HOST:10443` with your Scrypted server address. Deployment requ
 
 ## Audio fixes in this fork
 
-- Reassemble PCMA RTP into 1024-sample audio frames at 8 kHz, and send at 128 ms intervals instead of forwarding arbitrary RTP payload sizes immediately.
+- Reassemble PCMA RTP into 512-sample audio frames at 8 kHz and send at 64 ms intervals by default. A 1024-sample / 128 ms option is also available.
 - Preserve MPEG-TS continuity counters across PES boundaries; use the 90 kHz PTS clock, MPEG-2 PSI CRC, and valid stuffing.
 - Use TCP_NODELAY, write each multipart message together, and propagate socket backpressure. Bound queued live audio to about one second; discard old whole frames if the connection stalls.
-- Offer **Audio Sending** choices: `1024 samples / 128 ms` (default), or `VIGI RTP / immediate` to preserve each FFmpeg RTP payload as one PES and send it as it arrives. The VIGI option retains the corrected MPEG-TS timestamps, continuity counters, CRC, TCP_NODELAY, and bounded backpressure handling; it compares framing and cadence only.
+- Offer **Audio Sending** choices: `512 samples / 64 ms` (default) or `1024 samples / 128 ms`. The former immediate-send option has been removed; legacy immediate settings now use paced 64 ms. Existing explicit 128 ms selections are preserved.
 - Offer `aec` (default) and `half_duplex` in the camera's **Talk Mode** setting. Stop and restart talkback after changing the mode.
 
-The framing and pacing are based on direct speaker tests with a TP-Link TL-IPC43AN-WB4 V1.0, firmware 1.0.6 Build 200818 Rel.67021n. Both modes were audible and clear with the test sender. End-to-end HomeKit behavior still needs confirmation after installing this fork.
+The framing and pacing are based on direct speaker tests with a TP-Link TL-IPC43AN-WB4 V1.0, firmware 1.0.6 Build 200818 Rel.67021n. Both AEC and half-duplex were audible and clear with the test sender. The owner confirmed normal HomeKit talkback using paced 128 ms; direct script tests also produced recognizable speech at 64 ms. Sending 20 ms PES frames produced unintelligible, intermittent sound with TCP_NODELAY both enabled and disabled on this device. These observations do not establish the camera's internal failure mechanism.
 
 This is a fork of [sanskardhanda/scrypted-vigi](https://github.com/sanskardhanda/scrypted-vigi); the original MIT license and attribution are retained.
 
@@ -71,7 +71,7 @@ Fill in the mixin settings only when auto-detection is missing something or the 
 | `Username` | The existing ONVIF/RTSP camera was added with a non-admin user. Set this to `admin`. |
 | `Admin Password` | The existing ONVIF/RTSP camera password is missing, wrong, or belongs to a non-admin user. |
 | `Port` | The VIGI stream service is not reachable on `8800`. |
-| `Audio Sending` | Choose `1024 samples / 128 ms` (default) or `VIGI RTP / immediate`. Independent of AEC/half-duplex. Stop and restart talkback after changing. |
+| `Audio Sending` | Choose `512 samples / 64 ms` (default) or `1024 samples / 128 ms`. Independent of AEC/half-duplex. Stop and restart talkback after changing. |
 | `Talk Mode` | Choose `aec` for echo cancellation or `half_duplex` for one-way-at-a-time talkback. Default: `aec`. |
 | `Channel` | Multi-channel devices only. Most standalone cameras should stay on `0`. |
 
@@ -108,14 +108,16 @@ Video and talkback use different camera endpoints. Confirm that Scrypted can rea
 
 ### Inspect actual RTP audio sizes and timing
 
-Open the camera's **Console**, start a talk session for at least 5 seconds, and search for `TP-Link Talk audio stats:`. Summaries appear approximately every 5 seconds while RTP arrives, with any remaining statistics logged when talkback stops.
+Open the camera's **Console**. A successful talk session logs one start line and one compact summary after talkback stops, for example:
 
-- `rtpReceived.payloadSizes`: actual audio payload bytes after excluding RTP headers, extensions, and padding. Each entry includes its count and `audioMilliseconds`. For 8 kHz mono PCMA, 160 bytes = 20 ms, 512 bytes = 64 ms, 1024 bytes = 128 ms.
-- `rtpReceived.intervalMilliseconds`: minimum, mean, and maximum observed interval between incoming RTP packets. Arrival spacing can differ from the duration of audio inside a packet.
-- `pesWritten`: the corresponding audio frame sizes and intervals written to the camera stream. Paced mode can combine several incoming RTP payloads into one PES; VIGI mode keeps RTP payload boundaries.
-- `overloadDroppedSamples`: samples discarded from the bounded queue during network overload. Zero means no such discards were recorded.
+```text
+TP-Link Talk started: aec, 512 samples / 64 ms.
+TP-Link Talk ended: RTP [160B/20ms x250]; sent [512B/64ms x78]; mean write interval 64.5ms; overload drops 0 samples.
+```
 
-These are local receive/write measurements, not TCP packet captures or measurements of when the speaker played sound. Only lengths and timings are logged, not audio contents.
+The RTP section reports incoming audio payload sizes, audio durations and counts. The sent section reports the reassembled PES audio sizes and counts, plus their average write interval. For 8 kHz mono PCMA, 160 bytes = 20 ms, 512 bytes = 64 ms, 1024 bytes = 128 ms. Overload drops count samples discarded from the bounded queue while the connection was blocked.
+
+These are local receive/write measurements, not measurements of when the speaker played sound. FFmpeg banners, command lines and progress output are suppressed; warnings and errors remain visible. No audio contents are logged.
 
 ### Camera returns `-52411`
 

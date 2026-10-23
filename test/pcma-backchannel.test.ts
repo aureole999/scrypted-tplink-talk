@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Writable } from 'stream';
-import { audioSendModes, AudioSendingStatistics, PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
+import { audioSendModes, AudioSendingStatistics, normalizeAudioSendMode, PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
 
 class FakeClock {
     time = 0;
@@ -42,62 +42,70 @@ function audio(ts: Buffer): Buffer {
     return Buffer.concat(pes).subarray(14);
 }
 
-test('reassembles arbitrary RTP sizes into 1024-sample PES at 128 ms intervals', () => {
-    const clock = new FakeClock();
-    const writes: { at: number; data: Buffer }[] = [];
-    const output = new Writable({ write(data, _, callback) {
-        writes.push({ at: clock.now(), data: Buffer.from(data) }); callback();
-    } });
-    const sender = new PcmaBackchannel(output, { clock });
-    const samples = Buffer.from(Array.from({ length: 3072 }, (_, i) => i % 251));
-    for (let offset = 0; offset < samples.length; offset += 160)
-        sender.pushRtp(rtp(samples.subarray(offset, offset + 160)));
-    assert.equal(writes.length, 2); // tables and first complete frame
-    clock.advance(127);
-    assert.equal(writes.length, 2);
-    clock.advance(129);
-    assert.deepEqual(writes.slice(1).map(w => w.at), [0, 128, 256]);
-    assert.deepEqual(Buffer.concat(writes.slice(1).map(w => audio(w.data))), samples);
-    sender.stop();
-});
+for (const [frameSamples, frameMs, mode] of [
+    [512, 64, undefined], // omitted mode must use the new 64 ms default
+    [1024, 128, audioSendModes.paced],
+] as const) {
+    test(`reassembles arbitrary RTP sizes into ${frameSamples}-sample PES at ${frameMs} ms intervals`, () => {
+        const clock = new FakeClock();
+        const writes: { at: number; data: Buffer }[] = [];
+        const output = new Writable({ write(data, _, callback) {
+            writes.push({ at: clock.now(), data: Buffer.from(data) }); callback();
+        } });
+        const sender = new PcmaBackchannel(output, { clock, mode });
+        const samples = Buffer.from(Array.from({ length: frameSamples * 3 }, (_, i) => i % 251));
+        for (let offset = 0; offset < samples.length; offset += 160)
+            sender.pushRtp(rtp(samples.subarray(offset, offset + 160)));
+        assert.equal(writes.length, 2); // tables and first complete frame
+        clock.advance(frameMs - 1);
+        assert.equal(writes.length, 2);
+        clock.advance(frameMs + 1);
+        assert.deepEqual(writes.slice(1).map(w => w.at), [0, frameMs, frameMs * 2]);
+        assert.deepEqual(writes.slice(1).map(w => audio(w.data).length), [frameSamples, frameSamples, frameSamples]);
+        assert.deepEqual(Buffer.concat(writes.slice(1).map(w => audio(w.data))), samples);
+        sender.stop();
+    });
 
-test('late timers do not burst and stop cancels queued audio', () => {
-    const clock = new FakeClock();
-    const times: number[] = [];
-    const output = new Writable({ write(_data, _, callback) { times.push(clock.now()); callback(); } });
-    const sender = new PcmaBackchannel(output, { clock });
-    sender.pushRtp(rtp(Buffer.alloc(4096)));
-    clock.time = 500; // simulate a stalled event loop
-    clock.advance(0);
-    assert.deepEqual(times, [0, 0, 500]);
-    clock.advance(127);
-    assert.equal(times.length, 3);
-    sender.stop();
-    clock.advance(1000);
-    sender.pushRtp(rtp(Buffer.alloc(1024)));
-    assert.equal(times.length, 3);
-});
+    test(`${frameMs} ms timers do not burst after a stall and stop cancels queued audio`, () => {
+        const clock = new FakeClock();
+        const times: number[] = [];
+        const output = new Writable({ write(_data, _, callback) { times.push(clock.now()); callback(); } });
+        const sender = new PcmaBackchannel(output, { clock, mode });
+        sender.pushRtp(rtp(Buffer.alloc(frameSamples * 4)));
+        clock.time = 500;
+        clock.advance(0);
+        assert.deepEqual(times, [0, 0, 500]);
+        clock.advance(frameMs - 1);
+        assert.equal(times.length, 3);
+        sender.stop();
+        clock.advance(1000);
+        sender.pushRtp(rtp(Buffer.alloc(frameSamples)));
+        assert.equal(times.length, 3);
+    });
 
-test('bounded queue retains recent audio when the network is backpressured', async () => {
-    const clock = new FakeClock();
-    const writes: Buffer[] = [];
-    let complete: (() => void) | undefined;
-    const output = new Writable({ highWaterMark: 1, write(data, _, callback) {
-        writes.push(Buffer.from(data)); complete = callback;
-    } });
-    const sender = new PcmaBackchannel(output, { clock });
-    sender.pushRtp(rtp(Buffer.concat([Buffer.alloc(8192, 0x11), Buffer.alloc(8192, 0x22)])));
-    clock.advance(256);
-    assert.equal(writes.length, 1); // only PAT/PMT until TCP drains
-    complete!();
-    await new Promise<void>(resolve => setImmediate(resolve));
-    clock.advance(128);
-    assert.equal(writes.length, 2);
-    assert.deepEqual(audio(writes[1]), Buffer.alloc(1024, 0x22));
-    sender.stop();
-    complete!();
-    output.destroy();
-});
+    test(`${frameMs} ms queue remains bounded when the network is backpressured`, async () => {
+        const clock = new FakeClock();
+        const writes: Buffer[] = [];
+        const reports: AudioSendingStatistics[] = [];
+        let complete: (() => void) | undefined;
+        const output = new Writable({ highWaterMark: 1, write(data, _, callback) {
+            writes.push(Buffer.from(data)); complete = callback;
+        } });
+        const sender = new PcmaBackchannel(output, { clock, mode, onStatistics: stats => reports.push(stats) });
+        sender.pushRtp(rtp(Buffer.concat([Buffer.alloc(8192, 0x11), Buffer.alloc(8192, 0x22)])));
+        clock.advance(frameMs * 2);
+        assert.equal(writes.length, 1);
+        complete!();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        clock.advance(frameMs);
+        assert.equal(writes.length, 2);
+        assert.deepEqual(audio(writes[1]), Buffer.alloc(frameSamples, 0x22));
+        sender.stop();
+        assert.equal(reports[0].overloadDroppedSamples, 8192);
+        complete!();
+        output.destroy();
+    });
+}
 
 test('RTP parser skips CSRC, extension and padding; rejects malformed packets', () => {
     const packet = Buffer.alloc(12 + 4 + 8 + 3 + 2);
@@ -114,56 +122,29 @@ test('RTP parser skips CSRC, extension and padding; rejects malformed packets', 
 });
 
 
-test('VIGI mode preserves RTP frame sizes and sends at arrival time without pacing', () => {
-    const clock = new FakeClock();
-    const writes: { at: number; data: Buffer }[] = [];
-    const output = new Writable({ write(data, _, callback) {
-        writes.push({ at: clock.now(), data: Buffer.from(data) }); callback();
-    } });
-    const sender = new PcmaBackchannel(output, { clock, mode: audioSendModes.vigi });
-    const frames = [Buffer.alloc(160, 0x11), Buffer.alloc(1188, 0x22), Buffer.alloc(320, 0x33)];
-    sender.pushRtp(rtp(frames[0]));
-    clock.advance(7);
-    sender.pushRtp(rtp(frames[1]));
-    sender.pushRtp(rtp(frames[2]));
-    assert.deepEqual(writes.slice(1).map(w => w.at), [0, 7, 7]);
-    assert.deepEqual(writes.slice(1).map(w => audio(w.data)), frames);
-    clock.advance(1000);
-    assert.equal(writes.length, 4);
-    sender.stop();
-    sender.pushRtp(rtp(Buffer.alloc(160)));
-    assert.equal(writes.length, 4);
-});
-
-test('VIGI mode respects backpressure and retains recent complete RTP frames', async () => {
+test('removed immediate and unknown settings normalize to paced 64 ms', () => {
+    assert.equal(normalizeAudioSendMode(undefined), audioSendModes.paced64);
+    assert.equal(normalizeAudioSendMode('VIGI RTP / immediate'), audioSendModes.paced64);
+    assert.equal(normalizeAudioSendMode('unknown'), audioSendModes.paced64);
+    assert.equal(normalizeAudioSendMode(audioSendModes.paced64), audioSendModes.paced64);
+    assert.equal(normalizeAudioSendMode(audioSendModes.paced), audioSendModes.paced);
     const writes: Buffer[] = [];
-    let complete: (() => void) | undefined;
-    const output = new Writable({ highWaterMark: 1, write(data, _, callback) {
-        writes.push(Buffer.from(data)); complete = callback;
-    } });
-    const sender = new PcmaBackchannel(output, { mode: audioSendModes.vigi });
-    for (let i = 0; i < 10; i++)
-        sender.pushRtp(rtp(Buffer.alloc(1024, i)));
-    assert.equal(writes.length, 1);
-    complete!();
-    await new Promise<void>(resolve => setImmediate(resolve));
+    const output = new Writable({ write(data, _, callback) { writes.push(Buffer.from(data)); callback(); } });
+    const sender = new PcmaBackchannel(output, { mode: 'VIGI RTP / immediate' as typeof audioSendModes.paced });
+    sender.pushRtp(rtp(Buffer.alloc(160)));
+    assert.equal(writes.length, 1); // PAT/PMT only: legacy mode must not immediately send small RTP payloads
+    sender.pushRtp(rtp(Buffer.alloc(352)));
     assert.equal(writes.length, 2);
-    assert.deepEqual(audio(writes[1]), Buffer.alloc(1024, 2));
+    assert.equal(audio(writes[1]).length, 512);
     sender.stop();
-    complete!();
-    await new Promise<void>(resolve => setImmediate(resolve));
-    assert.equal(writes.length, 2);
-    assert.equal(output.listenerCount('drain'), 0);
-    output.destroy();
 });
-
 
 test('RTP statistics report payload sizes, audio durations and actual arrival intervals', () => {
     const clock = new FakeClock();
     const reports: AudioSendingStatistics[] = [];
     const output = new Writable({ write(_data, _, callback) { callback(); } });
     const sender = new PcmaBackchannel(output, {
-        clock, mode: audioSendModes.vigi, onStatistics: statistics => reports.push(statistics),
+        clock, onStatistics: statistics => reports.push(statistics),
     });
     sender.pushRtp(rtp(Buffer.alloc(160)));
     clock.advance(20);
@@ -173,8 +154,10 @@ test('RTP statistics report payload sizes, audio durations and actual arrival in
     assert.equal(reports.length, 0);
     clock.advance(4920);
     sender.pushRtp(rtp(Buffer.alloc(160)));
+    assert.equal(reports.length, 0); // no periodic logging, even after five seconds
+    sender.stop();
     assert.equal(reports.length, 1);
-    assert.equal(reports[0].reason, 'periodic');
+    assert.equal(reports[0].reason, 'stop');
     assert.equal(reports[0].windowMilliseconds, 5004);
     assert.deepEqual(reports[0].rtpReceived, {
         packets: 4,
@@ -186,10 +169,10 @@ test('RTP statistics report payload sizes, audio durations and actual arrival in
         ],
         intervalMilliseconds: { minimum: 20, mean: 1668, maximum: 4920 },
     });
-    assert.deepEqual(reports[0].pesWritten, reports[0].rtpReceived);
+    assert.deepEqual(reports[0].pesWritten.payloadSizes, [{ bytes: 512, audioMilliseconds: 64, count: 3 }]);
     sender.stop();
     sender.stop();
-    assert.equal(reports.length, 1); // no duplicate empty reports
+    assert.equal(reports.length, 1); // stop is idempotent
 });
 
 test('paced statistics distinguish incoming RTP sizes from outgoing PES aggregation', () => {
@@ -197,7 +180,7 @@ test('paced statistics distinguish incoming RTP sizes from outgoing PES aggregat
     const reports: AudioSendingStatistics[] = [];
     const output = new Writable({ write(_data, _, callback) { callback(); } });
     const sender = new PcmaBackchannel(output, {
-        clock, onStatistics: statistics => reports.push(statistics),
+        clock, mode: audioSendModes.paced, onStatistics: statistics => reports.push(statistics),
     });
     for (let i = 0; i < 3; i++)
         sender.pushRtp(rtp(Buffer.alloc(512)));

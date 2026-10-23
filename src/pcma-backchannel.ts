@@ -3,15 +3,20 @@ import { Writable } from 'stream';
 import { AudioPacketStatistics, AudioPacketSummary } from './audio-stats';
 import { MpegTSWriter, StreamTypePCMATapo } from './mpegts-writer';
 
-export const pcmaFrameSamples = 1024;
+export const pcmaFrameSamples = 512;
 export const pcmaFrameMilliseconds = pcmaFrameSamples * 1000 / 8000;
-const maximumBufferedSamples = pcmaFrameSamples * 8;
+const maximumBufferedSamples = 8192; // about one second at 8 kHz
 
 export const audioSendModes = {
     paced: '1024 samples / 128 ms',
-    vigi: 'VIGI RTP / immediate',
+    paced64: '512 samples / 64 ms',
 } as const;
 export type AudioSendMode = typeof audioSendModes[keyof typeof audioSendModes];
+
+export function normalizeAudioSendMode(value: unknown): AudioSendMode {
+    // Legacy immediate and unknown settings safely use the default paced mode.
+    return value === audioSendModes.paced ? audioSendModes.paced : audioSendModes.paced64;
+}
 
 interface Clock {
     now(): number;
@@ -33,7 +38,7 @@ interface BackchannelOptions {
 
 export interface AudioSendingStatistics {
     mode: AudioSendMode;
-    reason: 'periodic' | 'stop';
+    reason: 'stop';
     windowMilliseconds: number;
     rtpReceived: AudioPacketSummary;
     pesWritten: AudioPacketSummary;
@@ -69,8 +74,8 @@ export class PcmaBackchannel {
     private writer = new MpegTSWriter();
     private clock: Clock;
     private mode: AudioSendMode;
-    private immediateFrames: Buffer[] = [];
-    private immediateSamples = 0;
+    private frameSamples: number;
+    private frameMilliseconds: number;
     private rtpStatistics = new AudioPacketStatistics();
     private pesStatistics = new AudioPacketStatistics();
     private statisticsSince: number;
@@ -79,7 +84,9 @@ export class PcmaBackchannel {
 
     constructor(private output: Writable, options: BackchannelOptions = {}) {
         this.clock = options.clock || realClock;
-        this.mode = options.mode || audioSendModes.paced;
+        this.mode = normalizeAudioSendMode(options.mode);
+        this.frameSamples = this.mode === audioSendModes.paced ? 1024 : 512;
+        this.frameMilliseconds = this.frameSamples * 1000 / 8000;
         this.statisticsSince = this.clock.now();
         this.onStatistics = options.onStatistics;
         this.writer.addPES(68, StreamTypePCMATapo);
@@ -87,8 +94,6 @@ export class PcmaBackchannel {
         this.writer.writePMT();
         output.write(this.writer.resetBytes());
         output.once('close', this.stop);
-        if (this.mode === audioSendModes.vigi)
-            output.on('drain', this.flushImmediate);
     }
 
     pushRtp(rtp: Buffer): void {
@@ -103,30 +108,15 @@ export class PcmaBackchannel {
             return;
         if (this.onStatistics)
             this.rtpStatistics.record(payload.length, this.clock.now());
-        if (this.mode === audioSendModes.vigi) {
-            // Match upstream's framing/cadence: one PES per arriving RTP payload,
-            // with no 1024-sample aggregation or 128 ms timer.
-            this.immediateFrames.push(payload);
-            this.immediateSamples += payload.length;
-            while (this.immediateSamples > maximumBufferedSamples && this.immediateFrames.length > 1) {
-                const dropped = this.immediateFrames.shift()!.length;
-                this.immediateSamples -= dropped;
-                this.overloadDroppedSamples += dropped;
-            }
-            this.flushImmediate();
-            this.reportStatistics('periodic');
-            return;
-        }
         this.pending = Buffer.concat([this.pending, payload]);
         // UDP cannot be backpressured. Drop old whole audio frames on overload
         // rather than letting live talkback latency grow without a bound.
         if (this.pending.length > maximumBufferedSamples) {
-            const drop = Math.ceil((this.pending.length - maximumBufferedSamples) / pcmaFrameSamples) * pcmaFrameSamples;
+            const drop = Math.ceil((this.pending.length - maximumBufferedSamples) / this.frameSamples) * this.frameSamples;
             this.pending = this.pending.subarray(drop);
             this.overloadDroppedSamples += drop;
         }
         this.pump();
-        this.reportStatistics('periodic');
     }
 
     stop = (): void => {
@@ -137,19 +127,8 @@ export class PcmaBackchannel {
             this.clock.cancel(this.timer);
         this.timer = undefined;
         this.pending = Buffer.alloc(0);
-        this.immediateFrames = [];
-        this.immediateSamples = 0;
         this.output.off('close', this.stop);
-        this.output.off('drain', this.flushImmediate);
-        this.reportStatistics('stop');
-    };
-
-    private flushImmediate = (): void => {
-        while (!this.stopped && !this.output.destroyed && !this.output.writableNeedDrain && this.immediateFrames.length) {
-            const payload = this.immediateFrames.shift()!;
-            this.immediateSamples -= payload.length;
-            this.writeFrame(payload);
-        }
+        this.reportStatistics();
     };
 
     private writeFrame(payload: Buffer): void {
@@ -159,19 +138,17 @@ export class PcmaBackchannel {
         this.output.write(this.writer.resetBytes());
     }
 
-    private reportStatistics(reason: AudioSendingStatistics['reason']): void {
+    private reportStatistics(): void {
         if (!this.onStatistics)
             return;
         const now = this.clock.now();
-        if (reason === 'periodic' && now - this.statisticsSince < 5000)
-            return;
         const rtpReceived = this.rtpStatistics.snapshot();
         const pesWritten = this.pesStatistics.snapshot();
         if (!rtpReceived.packets && !pesWritten.packets)
             return;
         this.onStatistics({
             mode: this.mode,
-            reason,
+            reason: 'stop',
             windowMilliseconds: Math.round(now - this.statisticsSince),
             rtpReceived,
             pesWritten,
@@ -184,7 +161,7 @@ export class PcmaBackchannel {
     }
 
     private pump(): void {
-        if (this.stopped || this.timer !== undefined || this.pending.length < pcmaFrameSamples)
+        if (this.stopped || this.timer !== undefined || this.pending.length < this.frameSamples)
             return;
         if (this.output.destroyed) {
             this.stop();
@@ -195,13 +172,13 @@ export class PcmaBackchannel {
             this.timer = this.clock.schedule(() => {
                 this.timer = undefined;
                 this.pump();
-            }, delay > 0 ? delay : pcmaFrameMilliseconds);
+            }, delay > 0 ? delay : this.frameMilliseconds);
             return;
         }
-        this.writeFrame(this.pending.subarray(0, pcmaFrameSamples));
-        this.pending = this.pending.subarray(pcmaFrameSamples);
+        this.writeFrame(this.pending.subarray(0, this.frameSamples));
+        this.pending = this.pending.subarray(this.frameSamples);
         // A delayed event loop must not cause a burst of catch-up frames.
-        this.nextSendAt = this.clock.now() + pcmaFrameMilliseconds;
+        this.nextSendAt = this.clock.now() + this.frameMilliseconds;
         this.pump();
     }
 }
