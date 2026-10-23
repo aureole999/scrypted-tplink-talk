@@ -1,5 +1,6 @@
 import { performance } from 'perf_hooks';
 import { Writable } from 'stream';
+import { AudioPacketStatistics, AudioPacketSummary } from './audio-stats';
 import { MpegTSWriter, StreamTypePCMATapo } from './mpegts-writer';
 
 export const pcmaFrameSamples = 1024;
@@ -27,6 +28,16 @@ const realClock: Clock = {
 interface BackchannelOptions {
     mode?: AudioSendMode;
     clock?: Clock;
+    onStatistics?: (statistics: AudioSendingStatistics) => void;
+}
+
+export interface AudioSendingStatistics {
+    mode: AudioSendMode;
+    reason: 'periodic' | 'stop';
+    windowMilliseconds: number;
+    rtpReceived: AudioPacketSummary;
+    pesWritten: AudioPacketSummary;
+    overloadDroppedSamples: number;
 }
 
 // FFmpeg RTP boundaries are not camera audio frame boundaries.
@@ -60,10 +71,17 @@ export class PcmaBackchannel {
     private mode: AudioSendMode;
     private immediateFrames: Buffer[] = [];
     private immediateSamples = 0;
+    private rtpStatistics = new AudioPacketStatistics();
+    private pesStatistics = new AudioPacketStatistics();
+    private statisticsSince: number;
+    private overloadDroppedSamples = 0;
+    private onStatistics?: BackchannelOptions['onStatistics'];
 
     constructor(private output: Writable, options: BackchannelOptions = {}) {
         this.clock = options.clock || realClock;
         this.mode = options.mode || audioSendModes.paced;
+        this.statisticsSince = this.clock.now();
+        this.onStatistics = options.onStatistics;
         this.writer.addPES(68, StreamTypePCMATapo);
         this.writer.writePAT();
         this.writer.writePMT();
@@ -83,14 +101,20 @@ export class PcmaBackchannel {
         const payload = pcmaRtpPayload(rtp);
         if (!payload)
             return;
+        if (this.onStatistics)
+            this.rtpStatistics.record(payload.length, this.clock.now());
         if (this.mode === audioSendModes.vigi) {
             // Match upstream's framing/cadence: one PES per arriving RTP payload,
             // with no 1024-sample aggregation or 128 ms timer.
             this.immediateFrames.push(payload);
             this.immediateSamples += payload.length;
-            while (this.immediateSamples > maximumBufferedSamples && this.immediateFrames.length > 1)
-                this.immediateSamples -= this.immediateFrames.shift()!.length;
+            while (this.immediateSamples > maximumBufferedSamples && this.immediateFrames.length > 1) {
+                const dropped = this.immediateFrames.shift()!.length;
+                this.immediateSamples -= dropped;
+                this.overloadDroppedSamples += dropped;
+            }
             this.flushImmediate();
+            this.reportStatistics('periodic');
             return;
         }
         this.pending = Buffer.concat([this.pending, payload]);
@@ -99,11 +123,15 @@ export class PcmaBackchannel {
         if (this.pending.length > maximumBufferedSamples) {
             const drop = Math.ceil((this.pending.length - maximumBufferedSamples) / pcmaFrameSamples) * pcmaFrameSamples;
             this.pending = this.pending.subarray(drop);
+            this.overloadDroppedSamples += drop;
         }
         this.pump();
+        this.reportStatistics('periodic');
     }
 
     stop = (): void => {
+        if (this.stopped)
+            return;
         this.stopped = true;
         if (this.timer !== undefined)
             this.clock.cancel(this.timer);
@@ -113,6 +141,7 @@ export class PcmaBackchannel {
         this.immediateSamples = 0;
         this.output.off('close', this.stop);
         this.output.off('drain', this.flushImmediate);
+        this.reportStatistics('stop');
     };
 
     private flushImmediate = (): void => {
@@ -124,8 +153,34 @@ export class PcmaBackchannel {
     };
 
     private writeFrame(payload: Buffer): void {
+        if (this.onStatistics)
+            this.pesStatistics.record(payload.length, this.clock.now());
         this.writer.writePES(68, 192, payload);
         this.output.write(this.writer.resetBytes());
+    }
+
+    private reportStatistics(reason: AudioSendingStatistics['reason']): void {
+        if (!this.onStatistics)
+            return;
+        const now = this.clock.now();
+        if (reason === 'periodic' && now - this.statisticsSince < 5000)
+            return;
+        const rtpReceived = this.rtpStatistics.snapshot();
+        const pesWritten = this.pesStatistics.snapshot();
+        if (!rtpReceived.packets && !pesWritten.packets)
+            return;
+        this.onStatistics({
+            mode: this.mode,
+            reason,
+            windowMilliseconds: Math.round(now - this.statisticsSince),
+            rtpReceived,
+            pesWritten,
+            overloadDroppedSamples: this.overloadDroppedSamples,
+        });
+        this.statisticsSince = now;
+        this.rtpStatistics = new AudioPacketStatistics();
+        this.pesStatistics = new AudioPacketStatistics();
+        this.overloadDroppedSamples = 0;
     }
 
     private pump(): void {

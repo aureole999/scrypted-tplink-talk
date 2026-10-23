@@ -106,6 +106,17 @@ Open the mixin settings and manually set `Host`, `Username`, and `Admin Password
 
 Video and talkback use different camera endpoints. Confirm that Scrypted can reach the camera on port `8800` and check the Scrypted plugin logs for the exact VIGI error.
 
+### Inspect actual RTP audio sizes and timing
+
+Open the camera's **Console**, start a talk session for at least 5 seconds, and search for `TP-Link Talk audio stats:`. Summaries appear approximately every 5 seconds while RTP arrives, with any remaining statistics logged when talkback stops.
+
+- `rtpReceived.payloadSizes`: actual audio payload bytes after excluding RTP headers, extensions, and padding. Each entry includes its count and `audioMilliseconds`. For 8 kHz mono PCMA, 160 bytes = 20 ms, 512 bytes = 64 ms, 1024 bytes = 128 ms.
+- `rtpReceived.intervalMilliseconds`: minimum, mean, and maximum observed interval between incoming RTP packets. Arrival spacing can differ from the duration of audio inside a packet.
+- `pesWritten`: the corresponding audio frame sizes and intervals written to the camera stream. Paced mode can combine several incoming RTP payloads into one PES; VIGI mode keeps RTP payload boundaries.
+- `overloadDroppedSamples`: samples discarded from the bounded queue during network overload. Zero means no such discards were recorded.
+
+These are local receive/write measurements, not TCP packet captures or measurements of when the speaker played sound. Only lengths and timings are logged, not audio contents.
+
 ### Camera returns `-52411`
 
 The camera reports that its talk channel is already in use. End other talk sessions in Apple Home, the TP-Link app, or another Scrypted mixin, then try again. Do not run both the original VIGI mixin and TP-Link Talk on the same camera at once.

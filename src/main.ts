@@ -75,6 +75,7 @@ class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> im
             const mpegts = await client.startMpegTsBackchannel(mode);
             const backchannel = this.backchannel = new PcmaBackchannel(mpegts, {
                 mode: this.storageSettings.values.audioSendMode as AudioSendMode,
+                onStatistics: statistics => this.console.log('TP-Link Talk audio stats:', JSON.stringify(statistics)),
             });
             mpegts.on('error', e => {
                 this.console.error('TP-Link audio stream stopped:', e);

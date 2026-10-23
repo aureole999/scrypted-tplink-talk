@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Writable } from 'stream';
-import { audioSendModes, PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
+import { audioSendModes, AudioSendingStatistics, PcmaBackchannel, pcmaRtpPayload } from '../src/pcma-backchannel';
 
 class FakeClock {
     time = 0;
@@ -155,4 +155,59 @@ test('VIGI mode respects backpressure and retains recent complete RTP frames', a
     assert.equal(writes.length, 2);
     assert.equal(output.listenerCount('drain'), 0);
     output.destroy();
+});
+
+
+test('RTP statistics report payload sizes, audio durations and actual arrival intervals', () => {
+    const clock = new FakeClock();
+    const reports: AudioSendingStatistics[] = [];
+    const output = new Writable({ write(_data, _, callback) { callback(); } });
+    const sender = new PcmaBackchannel(output, {
+        clock, mode: audioSendModes.vigi, onStatistics: statistics => reports.push(statistics),
+    });
+    sender.pushRtp(rtp(Buffer.alloc(160)));
+    clock.advance(20);
+    sender.pushRtp(rtp(Buffer.alloc(512)));
+    clock.advance(64);
+    sender.pushRtp(rtp(Buffer.alloc(1024)));
+    assert.equal(reports.length, 0);
+    clock.advance(4920);
+    sender.pushRtp(rtp(Buffer.alloc(160)));
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].reason, 'periodic');
+    assert.equal(reports[0].windowMilliseconds, 5004);
+    assert.deepEqual(reports[0].rtpReceived, {
+        packets: 4,
+        audioMilliseconds: 232,
+        payloadSizes: [
+            { bytes: 160, audioMilliseconds: 20, count: 2 },
+            { bytes: 512, audioMilliseconds: 64, count: 1 },
+            { bytes: 1024, audioMilliseconds: 128, count: 1 },
+        ],
+        intervalMilliseconds: { minimum: 20, mean: 1668, maximum: 4920 },
+    });
+    assert.deepEqual(reports[0].pesWritten, reports[0].rtpReceived);
+    sender.stop();
+    sender.stop();
+    assert.equal(reports.length, 1); // no duplicate empty reports
+});
+
+test('paced statistics distinguish incoming RTP sizes from outgoing PES aggregation', () => {
+    const clock = new FakeClock();
+    const reports: AudioSendingStatistics[] = [];
+    const output = new Writable({ write(_data, _, callback) { callback(); } });
+    const sender = new PcmaBackchannel(output, {
+        clock, onStatistics: statistics => reports.push(statistics),
+    });
+    for (let i = 0; i < 3; i++)
+        sender.pushRtp(rtp(Buffer.alloc(512)));
+    clock.advance(128);
+    sender.pushRtp(rtp(Buffer.alloc(512)));
+    sender.stop();
+    sender.stop();
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].reason, 'stop');
+    assert.deepEqual(reports[0].rtpReceived.payloadSizes, [{ bytes: 512, audioMilliseconds: 64, count: 4 }]);
+    assert.deepEqual(reports[0].pesWritten.payloadSizes, [{ bytes: 1024, audioMilliseconds: 128, count: 2 }]);
+    assert.equal(reports[0].pesWritten.intervalMilliseconds?.mean, 128);
 });
