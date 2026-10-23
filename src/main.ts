@@ -2,12 +2,13 @@ import sdk, { DeviceProvider, FFmpegInput, Intercom, MediaObject, MixinProvider,
 import { SettingsMixinDeviceBase } from '@scrypted/sdk/settings-mixin';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { startPcmaRtpForwarder, AudioForwarder } from './audio-forwarder';
-import { MpegTSWriter, StreamTypePCMATapo } from './mpegts-writer';
-import { VigiApi } from './vigi-api';
+import { PcmaBackchannel } from './pcma-backchannel';
+import { VigiApi, TalkMode } from './vigi-api';
 
-class VigiIntercomMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> implements Intercom {
+class TpLinkTalkMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> implements Intercom {
     private client?: Promise<VigiApi>;
     private forwarder?: AudioForwarder;
+    private backchannel?: PcmaBackchannel;
 
     storageSettings = new StorageSettings(this, {
         host: {
@@ -31,6 +32,12 @@ class VigiIntercomMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> 
             type: 'number',
             defaultValue: 8800,
             description: 'The VIGI stream service port.',
+        },
+        talkMode: {
+            title: 'Talk Mode',
+            choices: ['aec', 'half_duplex'],
+            defaultValue: 'aec',
+            description: 'aec enables acoustic echo cancellation. Use half_duplex for one-way-at-a-time talkback.',
         },
         channel: {
             title: 'Channel',
@@ -57,28 +64,37 @@ class VigiIntercomMixin extends SettingsMixinDeviceBase<VideoCamera & Settings> 
 
         const client = await this.client;
         client.processMessages().catch(e => this.console.error('VIGI message processing stopped:', e));
-        const mpegts = await client.startMpegTsBackchannel();
-
-        const writer = new MpegTSWriter();
-        writer.addPES(68, StreamTypePCMATapo);
-        writer.writePAT();
-        writer.writePMT();
-        mpegts.write(writer.resetBytes());
-
-        this.forwarder = await startPcmaRtpForwarder(this.console, ffmpegInput, rtp => {
-            const payload = rtp.subarray(12);
-            if (!payload.length)
-                return;
-
-            writer.writePES(68, 192, payload);
-            mpegts.write(writer.resetBytes());
-        });
-
-        this.forwarder.killPromise.finally(() => client.close());
-        client.stream.on('close', () => this.forwarder?.kill());
+        try {
+            const mode = this.storageSettings.values.talkMode as TalkMode;
+            const mpegts = await client.startMpegTsBackchannel(mode);
+            const backchannel = this.backchannel = new PcmaBackchannel(mpegts);
+            mpegts.on('error', e => {
+                this.console.error('TP-Link audio stream stopped:', e);
+                backchannel.stop();
+                client.close();
+            });
+            const forwarder = this.forwarder = await startPcmaRtpForwarder(this.console, ffmpegInput,
+                rtp => backchannel.pushRtp(rtp));
+            forwarder.killPromise.finally(() => {
+                backchannel.stop();
+                client.close();
+            });
+            client.stream.once('close', () => {
+                backchannel.stop();
+                forwarder.kill();
+            });
+            if (client.stream.destroyed)
+                throw new Error('TP-Link talk connection closed during startup.');
+        }
+        catch (e) {
+            await this.stopIntercom();
+            throw e;
+        }
     }
 
     async stopIntercom(): Promise<void> {
+        this.backchannel?.stop();
+        this.backchannel = undefined;
         const forwarder = this.forwarder;
         this.forwarder = undefined;
         forwarder?.kill();
@@ -172,7 +188,7 @@ function getHostFromUrl(value?: string): string | undefined {
     }
 }
 
-class VigiIntercomProvider extends ScryptedDeviceBase implements MixinProvider {
+class TpLinkTalkProvider extends ScryptedDeviceBase implements MixinProvider {
     async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[] | undefined> {
         if (type !== ScryptedDeviceType.Doorbell && type !== ScryptedDeviceType.Camera)
             return;
@@ -186,10 +202,10 @@ class VigiIntercomProvider extends ScryptedDeviceBase implements MixinProvider {
     }
 
     async getMixin(mixinDevice: VideoCamera & Settings, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any> {
-        return new VigiIntercomMixin({
+        return new TpLinkTalkMixin({
             mixinProviderNativeId: this.nativeId,
-            group: 'VIGI Two Way Audio',
-            groupKey: 'vigi',
+            group: 'TP-Link Talk',
+            groupKey: 'tplink-talk',
             mixinDevice,
             mixinDeviceInterfaces,
             mixinDeviceState,
@@ -197,10 +213,11 @@ class VigiIntercomProvider extends ScryptedDeviceBase implements MixinProvider {
     }
 
     async releaseMixin(id: string, mixinDevice: any): Promise<void> {
+        await (mixinDevice as TpLinkTalkMixin).stopIntercom();
     }
 }
 
-class VigiPlugin extends ScryptedDeviceBase implements DeviceProvider {
+class TpLinkTalkPlugin extends ScryptedDeviceBase implements DeviceProvider {
     constructor(nativeId?: string) {
         super(nativeId);
 
@@ -211,18 +228,18 @@ class VigiPlugin extends ScryptedDeviceBase implements DeviceProvider {
                 interfaces: [
                     ScryptedInterface.MixinProvider,
                 ],
-                name: 'VIGI Two Way Audio',
+                name: 'TP-Link Talk',
             });
         });
     }
 
     async getDevice(nativeId: string): Promise<any> {
         if (nativeId === 'intercom')
-            return new VigiIntercomProvider('intercom');
+            return new TpLinkTalkProvider('intercom');
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
     }
 }
 
-export default VigiPlugin;
+export default TpLinkTalkPlugin;

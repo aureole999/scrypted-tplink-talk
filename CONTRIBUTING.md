@@ -21,7 +21,7 @@ npm run tsc
 npm test
 ```
 
-For live testing, install the plugin in Scrypted, add the camera through ONVIF or RTSP first, then enable the `VIGI Two Way Audio` mixin on that camera.
+For live testing, install the plugin in Scrypted, add the camera through ONVIF or RTSP first, then enable the `TP-Link Talk` mixin on that camera.
 
 ## Bug Reports
 

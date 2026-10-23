@@ -49,7 +49,7 @@ export async function startPcmaRtpForwarder(console: Console, ffmpegInput: FFmpe
         `udp://127.0.0.1:${port}?pkt_size=1200`,
     ];
 
-    console.log('Starting VIGI intercom ffmpeg:', args.join(' '));
+    console.log('Starting TP-Link Talk ffmpeg:', args.join(' '));
     const cp = child_process.spawn(ffmpegPath, args, {
         stdio: ['ignore', 'ignore', 'pipe'],
     });

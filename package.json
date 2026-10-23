@@ -1,7 +1,7 @@
 {
-  "name": "@metalbiker/scrypted-vigi",
+  "name": "@aureole999/scrypted-tplink-talk",
   "version": "0.1.0",
-  "description": "TP-Link VIGI two-way audio mixin plugin for Scrypted",
+  "description": "TP-Link local two-way audio mixin for Scrypted with selectable AEC and half-duplex modes",
   "main": "src/main.ts",
   "scripts": {
     "build": "scrypted-webpack",
@@ -30,15 +30,14 @@
     "homekit"
   ],
   "scrypted": {
-    "name": "VIGI Two Way Audio",
+    "name": "TP-Link Talk",
     "type": "DeviceProvider",
     "interfaces": [
       "DeviceProvider"
     ]
   },
   "dependencies": {
-    "@scrypted/sdk": "latest",
-    "crc-32": "^1.2.2"
+    "@scrypted/sdk": "latest"
   },
   "devDependencies": {
     "@types/node": "^20.10.8",
@@ -51,12 +50,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sanskardhanda/scrypted-vigi.git"
+    "url": "git+https://github.com/aureole999/scrypted-tplink-talk.git"
   },
   "bugs": {
-    "url": "https://github.com/sanskardhanda/scrypted-vigi/issues"
+    "url": "https://github.com/aureole999/scrypted-tplink-talk/issues"
   },
-  "homepage": "https://github.com/sanskardhanda/scrypted-vigi#readme",
+  "homepage": "https://github.com/aureole999/scrypted-tplink-talk#readme",
   "files": [
     "dist",
     "README.md"

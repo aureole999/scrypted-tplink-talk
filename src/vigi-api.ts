@@ -16,6 +16,8 @@ interface VigiResponse {
     [key: string]: any;
 }
 
+export type TalkMode = 'aec' | 'half_duplex';
+
 class Deferred<T> {
     promise: Promise<T>;
     resolve!: (value: T | PromiseLike<T>) => void;
@@ -69,6 +71,7 @@ export class VigiApi {
         const keyExchange = authenticated.headers['key-exchange'];
         api.keyExchange = Array.isArray(keyExchange) ? keyExchange[0] : keyExchange || '';
         api.stream.on('close', () => api.rejectPending(new Error('VIGI stream closed.')));
+        api.stream.on('error', e => api.rejectPending(e));
         return api;
     }
 
@@ -81,33 +84,32 @@ export class VigiApi {
         return this.processMessagesPromise;
     }
 
-    async startMpegTsBackchannel(): Promise<Writable> {
+    async startMpegTsBackchannel(mode: TalkMode = 'aec'): Promise<Writable> {
+        if (mode !== 'aec' && mode !== 'half_duplex')
+            throw new Error('Unsupported TP-Link talk mode.');
         const response = await this.request({
             talk: {
-                mode: 'aec',
+                mode,
             },
             method: 'get',
         });
 
+        if (response.error_code === -52411)
+            throw new Error('The camera talk channel is already in use (-52411). End the other talk session and try again.');
         if (response.error_code)
             throw new Error('Unexpected VIGI talk error: ' + JSON.stringify(response));
         if (!response.session_id)
             throw new Error('VIGI talk response did not include session_id.');
 
         this.backchannelSessionId = response.session_id;
-        const writable = new PassThrough();
-
-        writable.on('readable', () => {
-            let data: Buffer;
-            while ((data = writable.read()) !== null) {
-                this.stream.write('----client-stream-boundary--\r\n');
+        const writable = new Writable({
+            write: (data: Buffer, _encoding, callback) => {
                 writeMessage(this.stream, data, {
                     'Content-Type': 'audio/mp2t',
                     'X-If-Encrypt': '0',
                     'X-Session-Id': this.backchannelSessionId,
-                });
-                this.stream.write('\r\n');
-            }
+                }, callback);
+            },
         });
 
         this.stream.on('close', () => writable.destroy());
@@ -125,11 +127,9 @@ export class VigiApi {
         const deferred = new Deferred<VigiResponse>();
         this.requests.set(seq, deferred);
 
-        this.stream.write('----client-stream-boundary--\r\n');
         writeMessage(this.stream, Buffer.from(JSON.stringify(request)), {
             'Content-Type': 'application/json',
         });
-        this.stream.write('\r\n');
 
         return deferred.promise;
     }
@@ -272,18 +272,20 @@ async function readBody(readable: PassThrough, headers: Record<string, string>):
     return Buffer.concat(chunks);
 }
 
-function writeMessage(stream: Socket, body: Buffer, headers: Record<string, string | undefined>): void {
+function writeMessage(stream: Socket, body: Buffer, headers: Record<string, string | undefined>, callback?: (error?: Error | null) => void): void {
     const normalized = {
         ...headers,
         'Content-Length': body.length.toString(),
     };
 
-    for (const [key, value] of Object.entries(normalized)) {
-        if (value !== undefined)
-            stream.write(`${key}: ${value}\r\n`);
-    }
-    stream.write('\r\n');
-    stream.write(body);
+    const lines = Object.entries(normalized)
+        .filter(([, value]) => value !== undefined)
+        .map(([key, value]) => `${key}: ${value}\r\n`);
+    stream.write(Buffer.concat([
+        Buffer.from('----client-stream-boundary--\r\n' + lines.join('') + '\r\n'),
+        body,
+        Buffer.from('\r\n'),
+    ]), callback);
 }
 
 async function postStream(host: string, port: number, path: string, authorization?: string): Promise<{
@@ -293,6 +295,7 @@ async function postStream(host: string, port: number, path: string, authorizatio
 }> {
     return new Promise((resolve, reject) => {
         const socket = connect(port, host);
+        socket.setNoDelay(true);
         let buffer = Buffer.alloc(0);
         let settled = false;
 
