@@ -16,6 +16,10 @@ export class AudioPacketStatistics {
     private minimumInterval = Infinity;
     private maximumInterval = 0;
 
+    get count(): number {
+        return this.packets;
+    }
+
     record(bytes: number, time: number): void {
         this.sizes.set(bytes, (this.sizes.get(bytes) || 0) + 1);
         this.packets++;

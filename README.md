@@ -34,13 +34,47 @@ Replace `SCRYPTED_HOST:10443` with your Scrypted server address. Deployment requ
 
 ## Audio fixes in this fork
 
-- Reassemble PCMA RTP into 512-sample audio frames at 8 kHz and send at 64 ms intervals by default. A 1024-sample / 128 ms option is also available.
+- Reassemble PCMA RTP into 512-sample audio frames at 8 kHz and send at 64 ms intervals by default. A 1024-sample / 128 ms option is also available and was used with the TP-Link VIGI C540-W 2.0 IPC, firmware 2.2.3 Build 260624 Rel.34757n, and the TP-Link VIGI C340-W 2.20 IPC, firmware 2.2.3 Build 260616 Rel.12538n. The 512/64 default is the lower-latency option and is the mode with the most direct speaker testing on the TL-IPC43AN-WB4.
+- Keep an absolute send schedule rather than resetting the deadline after every write. This prevents a long talkback call from accumulating hundreds of milliseconds of delay and then dropping frames. If the event loop stalls, missed slots are skipped instead of sending a catch-up burst of queued audio.
 - Preserve MPEG-TS continuity counters across PES boundaries; use the 90 kHz PTS clock, MPEG-2 PSI CRC, and valid stuffing.
-- Use TCP_NODELAY, write each multipart message together, and propagate socket backpressure. Bound queued live audio to about one second; discard old whole frames if the connection stalls.
+- Use TCP_NODELAY, write each multipart message together, and propagate socket backpressure. Bound queued live audio to about one second; discard old whole frames if the connection stalls. The backchannel `Writable` in front of the socket has an explicit 2 KiB high-water mark so Node's default multi-second buffer cannot add stale audio behind the application queue.
+- Stop microphone capture immediately, then pace the newest 64/128 ms of buffered audio and three silence frames when talkback stops. Allow the last frame to play plus a bounded 500 ms grace period before closing, so releasing the talk button does not clip the last syllable.
+- Include the configured `Channel` in the talk request, so the mixin can target NVR/multi-channel talkback instead of always using channel 0. The channel range (`0` to `256`) is enforced; channel `0` is omitted from the request.
+- Authenticate the Digest challenge and the authenticated request on the **same TCP connection**. Some camera firmwares bind the nonce to the connection.
+- Fail a talk request with a clear timeout if the camera does not answer, instead of leaving the intercom hanging.
+- Serialize `startIntercom`/`stopIntercom`, await the old socket close, and terminate the old ffmpeg process (SIGTERM, then SIGKILL) so closely spaced HomeKit calls cannot overlap talk sessions.
+- Cancel pending media conversion, settings lookup, and encoder startup waits on stop; cancelled queued starts do not call the media manager. Encoder spawn failures reject startup rather than reporting a successful talk session.
 - Offer **Audio Sending** choices: `512 samples / 64 ms` (default) or `1024 samples / 128 ms`. The former immediate-send option has been removed; legacy immediate settings now use paced 64 ms. Existing explicit 128 ms selections are preserved.
 - Offer `aec` (default) and `half_duplex` in the camera's **Talk Mode** setting. Stop and restart talkback after changing the mode.
 
-The framing and pacing are based on direct speaker tests with a TP-Link TL-IPC43AN-WB4 V1.0, firmware 1.0.6 Build 200818 Rel.67021n. Both AEC and half-duplex were audible and clear with the test sender. The owner confirmed normal HomeKit talkback using paced 128 ms; direct script tests also produced recognizable speech at 64 ms. Sending 20 ms PES frames produced unintelligible, intermittent sound with TCP_NODELAY both enabled and disabled on this device. These observations do not establish the camera's internal failure mechanism.
+The framing and pacing defaults are based on direct speaker tests with a TP-Link TL-IPC43AN-WB4 V1.0, firmware 1.0.6 Build 200818 Rel.67021n. Both AEC and half-duplex were audible and clear with the test sender. The owner confirmed normal HomeKit talkback using paced 128 ms; direct script tests also produced recognizable speech at 64 ms. Sending 20 ms PES frames produced unintelligible, intermittent sound with TCP_NODELAY both enabled and disabled on this device. These observations do not establish the camera's internal failure mechanism.
+
+The multipart upload headers (`X-If-Encrypt: 0`, `X-Session-Id`, `Content-Length`) and the tail-flush behaviour come from the working fork; `X-If-Encrypt: 0` is a fork interpretation. The 512/64 mode has not been speaker-tested on either VIGI model.
+
+### Validation
+
+`npm test` runs the unit, wire-format and mock-camera integration tests without a camera. They cover:
+
+- `securityEncode` vectors for the 8800 Digest password.
+- Digest parsing/response vectors, `qop=auth`, `qop` lists, missing `opaque`, and MD5-only validation.
+- Same-connection Digest challenge/authentication (including nonce-to-connection binding), one retry after a rejected nonce, handshake/talk timeouts, and pending-request rejection on timeout/close.
+- The exact talk JSON (`mode`, optional `channel`, `seq`, `type`), `-52411` busy/release handling, and other camera errors.
+- One-buffer `audio/mp2t` parts with `X-If-Encrypt: 0`, `X-Session-Id`, `Content-Length` and the trailing CRLF.
+- Expected PAT/PMT bytes, plus PES structure, MPEG-2 CRC, 90 kHz PTS (including wrap), per-PID continuity counters, PSI/adaptation stuffing, and stream-type `0x90`.
+- PCMA frame reassembly at 512/64 and 1024/128, absolute pacing without catch-up bursts, bounded queues, whole-frame overload drops, and 512/1024 tail silence.
+- The full API + backchannel path against a mock 8800 camera, including a `200` plus first multipart part in one TCP read, interleaved video/JSON parts, split multipart bodies, bounded JSON and discarded large video parts, and graceful closing delimiters.
+- Bounded HTTP/multipart framing: 8 KiB lines, 32 KiB header blocks, 64 headers, and a 64 KiB HTTP challenge-body limit.
+- The `TalkSession` lifecycle with an injected fake client/forwarder: start/stop order, abort, connect failure, read-loop/transport teardown, forwarder exit, and stop-during-startup invalidation.
+- Typed VIGI errors (`kind`, camera `code`, HTTP status, retryable/sent) and readable log descriptions.
+- ffmpeg argument construction (including URL fallback, `ffmpegPath` and `env`) and forwarder lifecycle/socket cleanup, SIGTERM/SIGKILL escalation, and credential redaction.
+- Mixin-level cancellation/disposal with stalled SDK calls, real missing-executable failures, paced tail playback, and stderr redaction across every byte boundary. Overlong stderr lines are dropped in full.
+- Connection detection with masked passwords, host/IPv6/port parsing, URL credentials, and a timeout around the parent camera's settings.
+
+The talk lifecycle is isolated in `src/talk-session.ts` so it can be tested without the Scrypted SDK; the mixin is thin settings/UI/serialization glue. API failures use typed `VigiError` objects (`kind`, camera `code`, HTTP status, retryable/sent), and JSON/video parts are bounded or streamed away instead of being buffered without limit.
+
+The talk input is expected to be a live Scrypted intercom stream (`inputArguments` or a URL). `pipe:0`/stdin inputs are rejected with a clear error. File inputs are not rejected, but they are not paced (no `-re`): ffmpeg consumes them as fast as it can and the bounded queue drops most of the message. Use a live source for talkback.
+
+The tests do not replace a live speaker test. The camera can only confirm audibility, echo behaviour, and whether 512/64 or 1024/128 sounds better on a specific VIGI model.
 
 This is a fork of [sanskardhanda/scrypted-vigi](https://github.com/sanskardhanda/scrypted-vigi); the original MIT license and attribution are retained.
 
@@ -59,7 +93,7 @@ This is a fork of [sanskardhanda/scrypted-vigi](https://github.com/sanskardhanda
 
 Blank settings are intentional. The mixin tries to read the IP address, username, and password from the ONVIF or RTSP camera that it is attached to. If the camera was added with the VIGI `admin` credentials, you usually do not need to enter anything again.
 
-Auto-detection looks for common camera settings such as `ip`, `host`, `address`, `url`, `rtspUrl`, `username`, and `password`. Different Scrypted camera plugins expose different setting names, so manual overrides are available when detection cannot find everything.
+Auto-detection looks for common camera settings such as `ip`, `host`, `address`, `url`, `rtspUrl`, `username`, and `password`. It tries every URL candidate (so a malformed `url` does not mask a valid `rtspUrl`) and extracts `user:password@` credentials when separate settings are missing, but only from URLs matching the selected host. A snapshot/proxy URL cannot borrow another host's camera credentials; set the camera Host explicitly if needed. Different Scrypted camera plugins expose different setting names, so manual overrides are available when detection cannot find everything.
 
 ## Manual Settings
 
@@ -73,7 +107,7 @@ Fill in the mixin settings only when auto-detection is missing something or the 
 | `Port` | The VIGI stream service is not reachable on `8800`. |
 | `Audio Sending` | Choose `512 samples / 64 ms` (default) or `1024 samples / 128 ms`. Independent of AEC/half-duplex. Stop and restart talkback after changing. |
 | `Talk Mode` | Choose `aec` for echo cancellation or `half_duplex` for one-way-at-a-time talkback. Default: `aec`. |
-| `Channel` | Multi-channel devices only. Most standalone cameras should stay on `0`. |
+| `Channel` | Multi-channel devices only. Most standalone cameras should stay on `0`; channel 0 is omitted from the talk request, non-zero values are sent. |
 
 ## HomeKit
 
@@ -112,12 +146,12 @@ Open the camera's **Console**. A successful talk session logs one start line and
 
 ```text
 TP-Link Talk started: aec, 512 samples / 64 ms.
-TP-Link Talk ended: RTP [160B/20ms x250]; sent [512B/64ms x78]; mean write interval 64.5ms; overload drops 0 samples.
+TP-Link Talk ended: RTP [160B/20ms x250]; sent [512B/64ms x78]; mean write interval ~64ms; overload drops 0 samples.
 ```
 
 The RTP section reports incoming audio payload sizes, audio durations and counts. The sent section reports the reassembled PES audio sizes and counts, plus their average write interval. For 8 kHz mono PCMA, 160 bytes = 20 ms, 512 bytes = 64 ms, 1024 bytes = 128 ms. Overload drops count samples discarded from the bounded queue while the connection was blocked.
 
-These are local receive/write measurements, not measurements of when the speaker played sound. FFmpeg banners, command lines and progress output are suppressed; warnings and errors remain visible. No audio contents are logged.
+These are local receive/write measurements, not measurements of when the speaker played sound. FFmpeg banners, command lines and progress output are suppressed; warnings and errors remain visible. No audio contents are logged, and complete stderr lines are assembled before redacting `user:password@` / token-like values. Lines exceeding 8 KiB are omitted rather than logging potentially sensitive fragments.
 
 ### Camera returns `-52411`
 

@@ -37,7 +37,8 @@
     ]
   },
   "dependencies": {
-    "@scrypted/sdk": "latest"
+    "@scrypted/sdk": "latest",
+    "audit": "^0.0.6"
   },
   "devDependencies": {
     "@types/node": "^20.10.8",
@@ -45,6 +46,7 @@
     "typescript": "^5.4.5"
   },
   "overrides": {
+    "adm-zip": "^0.6.1",
     "serialize-javascript": "^7.0.6"
   },
   "license": "MIT",
