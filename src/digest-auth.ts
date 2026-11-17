@@ -1,6 +1,10 @@
 import crypto from 'crypto';
+import { VigiError } from './vigi-error';
 
-const authKeyValue = /(\w+)=["']?([^'",]+)["']?/;
+// Quoted-string values may contain commas (for example qop="auth,auth-int"),
+// so parse the challenge as a sequence of key/value pairs instead of splitting
+// on every comma.
+const authKeyValue = /(\w+)=(?:"((?:\\.|[^"\\])*)"|([^,\s]+))/g;
 const ncPad = '00000000';
 
 export interface DigestAuthOptions {
@@ -10,13 +14,11 @@ export interface DigestAuthOptions {
 
 export function parseDigestHeader(header: string): Record<string, string> {
     const digest = header.trim().replace(/^Digest\s+/i, '');
-    const parts = digest.split(',');
     const options: Record<string, string> = {};
 
-    for (const part of parts) {
-        const match = part.trim().match(authKeyValue);
-        if (match)
-            options[match[1]] = match[2].replace(/["']/g, '');
+    for (const match of digest.matchAll(authKeyValue)) {
+        const value = match[2] ?? match[3] ?? '';
+        options[match[1].toLowerCase()] = value.replace(/\\(.)/g, '$1');
     }
 
     return options;
@@ -30,14 +32,24 @@ export function digestAuthHeader(method: string, uri: string, wwwAuthenticate: s
     const digest = parseDigestHeader(wwwAuthenticate);
 
     if (!digest.realm || !digest.nonce)
-        throw new Error('Invalid digest challenge: missing realm or nonce.');
+        throw new VigiError('Invalid digest challenge: missing realm or nonce.', 'protocol');
 
-    let qop = digest.qop || '';
-    if (qop)
-        qop = qop.split(',')[0];
+    const algorithm = (digest.algorithm || 'MD5').toUpperCase();
+    if (algorithm !== 'MD5')
+        throw new VigiError(`Unsupported digest algorithm: ${digest.algorithm}.`, 'protocol');
+
+    const qopValues = (digest.qop || '').split(',').map(value => value.trim()).filter(Boolean);
+    // Only qop=auth is implemented: qop=auth-int requires hashing the request
+    // body, and the VIGI stream request has an empty body.
+    const qop = qopValues.includes('auth') ? 'auth' : qopValues[0] || '';
+    if (qop && qop !== 'auth')
+        throw new VigiError(`Unsupported digest qop: ${qop}.`, 'protocol');
 
     const ncNumber = options.nc ?? 1;
-    const nc = ncPad.substring(String(ncNumber).length) + ncNumber;
+    if (!Number.isInteger(ncNumber) || ncNumber < 0 || ncNumber > 99999999)
+        throw new VigiError(`Digest nonce count is out of range: ${ncNumber}.`, 'config');
+    const nc = String(ncNumber).padStart(ncPad.length, '0');
+
     const cnonce = options.cnonce ?? crypto.randomBytes(8).toString('hex');
     const ha1 = md5(`${username}:${digest.realm}:${password}`);
     const ha2 = md5(`${method.toUpperCase()}:${uri}`);
